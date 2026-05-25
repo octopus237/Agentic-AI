@@ -212,9 +212,12 @@ def get_chain(agent_id, ts, window=30):
     aft = (t+timedelta(minutes=window)).strftime("%Y-%m-%dT%H:%M:%SZ")
     ts0 = t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    print(f"  [indexer] Fetching event timeline for agent {agent_id} "
+          f"({bef[11:16]} to {aft[11:16]})...")
     raw = ix_search({"bool":{"must":[{"term":{"agent.id":agent_id}},
                                       {"range":{"timestamp":{"gte":bef,"lte":aft}}}]}},
                     size=60, sort=[{"timestamp":{"order":"asc"}}])
+    print(f"  [indexer] Found {raw['total']} events in timeline")
     events = []
     for h in raw["hits"]:
         et  = h.get("timestamp","")[:19]
@@ -326,6 +329,7 @@ def select_enrichment(behaviors, aid, since):
 
     # Always: ports
     try:
+        print(f"  [server api] GET /syscollector/{aid}/ports — open ports and listening services")
         ports = wget(f"/syscollector/{aid}/ports")
         ev["CURRENT_OPEN_PORTS"] = _fmt_ports(ports.get("affected_items",[]))
     except Exception as e:
@@ -335,6 +339,7 @@ def select_enrichment(behaviors, aid, since):
     if any(b in behaviors for b in ["credential_dump","pass_the_hash",
                                      "lateral_smb","wmi_execution","psexec"]):
         try:
+            print(f"  [indexer] Querying authentication timeline for agent {aid}...")
             auth = ix_search({"bool":{"must":[
                 {"term":{"agent.id":aid}},{"range":{"timestamp":{"gte":since}}},
                 {"bool":{"should":[{"match":{"rule.groups":g}} for g in
@@ -357,6 +362,7 @@ def select_enrichment(behaviors, aid, since):
             ev["AUTH_TIMELINE"] = f"  unavailable: {e}"
 
         try:
+            print(f"  [server api] GET /syscollector/{aid}/processes — checking for credential dump tools")
             procs = wget(f"/syscollector/{aid}/processes",{"limit":100})
             items = procs.get("affected_items",[])
             tools = [p for p in items if any(k in (p.get("name","")+p.get("cmd","")).lower()
@@ -375,6 +381,7 @@ def select_enrichment(behaviors, aid, since):
     # FIM change / script drop / persistence -> syscheck
     if any(b in behaviors for b in ["fim_change","script_drop","persistence","exploit"]):
         try:
+            print(f"  [server api] GET /syscheck/{aid} — file integrity changes")
             fim  = wget(f"/syscheck/{aid}",{"limit":50})
             items= fim.get("affected_items",[])
             SUSP = ["/tmp","/dev/shm","appdata","temp","system32","\\run","startup"]
@@ -403,6 +410,7 @@ def select_enrichment(behaviors, aid, since):
     # PowerShell -> targeted process search
     if "powershell" in behaviors and "RUNNING_PROCESSES" not in ev:
         try:
+            print(f"  [server api] GET /syscollector/{aid}/processes — looking for active PowerShell")
             procs = wget(f"/syscollector/{aid}/processes",{"limit":50})
             ps    = [p for p in procs.get("affected_items",[])
                      if "powershell" in p.get("name","").lower()]
@@ -412,6 +420,46 @@ def select_enrichment(behaviors, aid, since):
                 for p in ps) or "  none active"
         except Exception as e:
             ev["POWERSHELL_PROCESSES"] = f"  unavailable: {e}"
+
+    # Installed packages — relevant for exploit, persistence, defense_evasion
+    # Helps the model identify vulnerable or suspicious software
+    if any(b in behaviors for b in ["exploit", "persistence", "defense_evasion",
+                                     "script_drop", "process_injection"]):
+        try:
+            print(f"  [server api] GET /syscollector/{aid}/packages — installed software inventory")
+            pkgs = wget(f"/syscollector/{aid}/packages", {"limit": 100})
+            items = pkgs.get("affected_items", [])
+            if items:
+                # Flag packages that are commonly abused or indicate risk
+                SUSPECT = ["python", "perl", "ruby", "php", "nmap", "netcat", "nc",
+                           "mimikatz", "metasploit", "sqlmap", "hydra", "john",
+                           "wireshark", "tcpdump", "putty", "winscp", "psexec",
+                           "sysinternals", "powersploit", "invoke-", "cobalt"]
+                flagged = []
+                all_pkgs = []
+                for p in items:
+                    name    = p.get("name", "")
+                    version = p.get("version", "")
+                    vendor  = p.get("vendor", "")
+                    all_pkgs.append(f"{name} {version}".strip())
+                    if any(s in name.lower() for s in SUSPECT):
+                        flagged.append(f"  [FLAGGED] {name} {version} ({vendor})")
+
+                lines = []
+                if flagged:
+                    lines.append("Flagged packages (potentially suspicious):")
+                    lines.extend(flagged)
+                # Show total count and a sample of recent/notable packages
+                lines.append(f"Total installed: {len(items)} packages")
+                # Show last 10 (often most recently installed)
+                lines.append("Recently indexed (sample):")
+                for p in items[-10:]:
+                    lines.append(f"  {p.get('name','')} {p.get('version','')} — {p.get('vendor','unknown vendor')}")
+                ev["INSTALLED_PACKAGES"] = "\n".join(lines)
+            else:
+                ev["INSTALLED_PACKAGES"] = "  no package data available (agent may be offline)"
+        except Exception as e:
+            ev["INSTALLED_PACKAGES"] = f"  unavailable: {e}"
 
     return ev
 
@@ -448,6 +496,7 @@ def collect(alert, since, chain=None):
                                              {"range":{"timestamp":{"gte":since}}}]}},
                            size=15, sort=[{"timestamp":{"order":"desc"}}])
         return {"agent_status":   "NOT IN WAZUH ENROLLMENT -- indexer only",
+                "behaviors_raw":  beh,
                 "BEHAVIORS":      fmt_behaviors(beh),
                 "SYSMON_EVENTS":  _fmt_sysmon(sysmon["hits"]),
                 "RECENT_ALERTS":  NL.join(
@@ -456,13 +505,16 @@ def collect(alert, since, chain=None):
                     f"{h.get('rule',{}).get('description','')[:65]}"
                     for h in recent["hits"][:10]) or "  none"}
 
-    ev = {"agent_os":"Windows" if is_win else "Linux", "BEHAVIORS":fmt_behaviors(beh)}
+    ev = {"agent_os":"Windows" if is_win else "Linux", "BEHAVIORS":fmt_behaviors(beh),
+           "behaviors_raw": beh}
 
     # Windows: always get Sysmon events
     if is_win:
+        print(f"  [indexer] Querying Sysmon/Windows events for agent {aid}...")
         sysmon = _sysmon_q(aid, since,
             groups=["sysmon","windows","impacket","sysmon_eid7_detections",
                     "sysmon_eid10_detections","sysmon_eid11_detections"], size=30)
+        print(f"  [indexer] Found {sysmon['total']} Sysmon events")
         ev["SYSMON_EVENTS"] = _fmt_sysmon(sysmon["hits"])
         ev["sysmon_total"]  = sysmon["total"]
 
@@ -491,93 +543,101 @@ def _fmt_chain(evts):
     return NL.join(lines) or "    (none)"
 
 # -- System prompt -------------------------------------------------------------
-SYSTEM_PROMPT = """You are a senior SOC analyst. You receive:
-- BEHAVIORS: patterns detected by the correlation engine (high/medium confidence)
-- SYSMON_EVENTS / FIM_CHANGES / AUTH_TIMELINE: forensic evidence from Wazuh APIs
-- ATTACK CHAIN: all events +-30min around the trigger (any severity)
+SYSTEM_PROMPT = """You are a SOC analyst. Write a short security report using only the evidence provided.
 
-========================================
-STEP 1 -- UNDERSTAND THE EVIDENCE
-========================================
-Read BEHAVIORS first -- the correlation engine already identified the attack patterns.
-Then read SYSMON_EVENTS and the chain for specific forensic detail.
-Parent-child process relationships and command-line arguments are the most reliable evidence.
+Rules:
+- Plain text only. No markdown. No bold. No tables.
+- Use dashes for bullets.
+- Name exact processes, file paths, timestamps from the evidence.
+- For MITRE: use tactic names only (Execution, Persistence, etc). Do not write T#### IDs.
+- Stop writing after NEXT STEPS.
 
-========================================
-STEP 2 -- IDENTIFY MITRE ATT&CK
-========================================
-Derive techniques from the ACTUAL evidence -- process names, commands, registry keys,
-file paths -- NOT from alert titles or rule descriptions alone.
+Format:
 
-Use your knowledge of MITRE ATT&CK to map what you observe:
-- What process spawned what? -> Execution technique
-- What command was run? -> Execution sub-technique
-- What was accessed? (ADMIN$, LSASS, registry) -> Lateral Movement or Credential Access
-- What was created? (service, scheduled task, registry key) -> Persistence technique
-- What was erased or hidden? -> Defense Evasion technique
-
-If you observe a behavior not covered by a known technique, describe it accurately
-and note it is unclassified. Never fabricate technique IDs.
-
-========================================
-STEP 3 -- WRITE THE REPORT
-========================================
-
--------------------------------------
-ALERT  : <rule> | Level <N> | <agent>
-TIME   : <timestamp>
-STATUS : Agent <active / DISCONNECTED>
--------------------------------------
 WHAT HAPPENED
-  3-4 sentences. Start from BEHAVIORS. Name exact processes and commands.
+- [timestamp] [process] [exact action]
+- [timestamp] [process] [exact action]
+- [timestamp] [process] [exact action]
 
-KILL CHAIN
-  Delivery  : <initial access vector>
-  Execution : <exact command or process>
-  Impact    : <lateral movement / credential access / persistence / evasion>
+ATTACK CHAIN
+- Delivery: [how attacker got in]
+- Execution: [exact command or process used]
+- Impact: [persistence / credential access / lateral movement / evasion]
 
-KEY EVIDENCE
-  <3-5 lines: timestamp | process or source | action | significance>
-
-ASSESSMENT  : Confirmed suspicious / Possibly suspicious / Likely benign
-  <One paragraph. Name the attack technique or tool. Explain attacker objective.>
-  A disconnected agent does NOT reduce confidence when Sysmon/chain evidence is strong.
-
-MITRE
-  Primary  : T#### -- Technique Name (Tactic)
-  Secondary: T#### -- Technique Name (Tactic)  [only if directly evidenced]
-  Kill chain stage: <Initial Access -> Execution -> ...>
-
-RISK  : CRITICAL / HIGH / MEDIUM / LOW
-  CRITICAL = confirmed RCE, credential dump, lateral movement, or cleanup actions
-  HIGH     = strong attack indicators, incomplete confirmation
-  MEDIUM   = suspicious pattern, possible false positive
-  LOW      = almost certainly benign
-  Reason: <one sentence -- specific evidence>
+MITRE ATT&CK
+- Primary tactic: [tactic name] - [technique description]
+- Secondary tactic: [tactic name] - [technique description]
 
 NEXT STEPS
-  Immediate:
-  - <containment or isolation action>
-  - <evidence to preserve>
-  Investigation:
-  - <exact log / registry key / directory to examine>
-  - <specific question to answer from the evidence>
--------------------------------------
-Under 600 words. No markdown. No code blocks. Fill every field."""
+Immediate:
+- [specific containment action]
+- [specific evidence to preserve]
+Investigate:
+- [exact file, registry key, or log]
+- [specific question from the evidence]
+"""
+
 
 # -- LLM call -----------------------------------------------------------------
+# MITRE ATT&CK tactics — stable, only 14 of them, never change
+# Used to validate that the model uses tactic names not invented technique IDs.
+MITRE_TACTICS = {
+    "Initial Access", "Execution", "Persistence", "Privilege Escalation",
+    "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
+    "Collection", "Command and Control", "Exfiltration", "Impact",
+    "Reconnaissance", "Resource Development"
+}
+
+import re as _re
+
+def _validate_report(report, behaviors):
+    """
+    Lightweight post-generation check. No model call — pure Python.
+    Only checks structural completeness and risk calibration.
+    MITRE validation removed — tactic names are enforced via system prompt,
+    not a curated ID list that requires constant maintenance.
+    """
+    problems = []
+    report_upper = report.upper()
+
+    # Required sections present
+    for section in ["WHAT HAPPENED", "RISK", "NEXT STEPS"]:
+        if section not in report_upper:
+            problems.append(f"Missing section: {section}")
+
+    # CRITICAL risk without HIGH-confidence Python-detected behavior
+    if "CRITICAL" in report_upper:
+        has_high = any(
+            b.get("confidence") == "high"
+            for b in behaviors.values()
+        ) if behaviors else False
+        if not has_high:
+            problems.append("CRITICAL risk with no HIGH-confidence behaviors detected")
+
+    return problems
+
+
 def call_llm(alert, evidence, chain):
+    """Single model call with thinking disabled for speed."""
+    import threading, re as _reval
+
     chain_str = ""
-    if chain and chain.get("total",0) > 0:
+    if chain and chain.get("total", 0) > 0:
         pats = "; ".join(chain["patterns"]) if chain["patterns"] else "none"
         chain_str = (
             f"\nATTACK CHAIN ({chain['total']} events +-30min):\n"
             f"  Patterns : {pats}\n"
             f"  Src IPs  : {', '.join(chain['src_ips']) or 'none'}\n"
-            f"  MITRE    : {', '.join(chain['tactics']) or 'none'}\n"
-            f"  BEFORE:\n{_fmt_chain(chain['before'][-4:])}\n"
-            f"  AFTER:\n{_fmt_chain(chain['after'][:4])}\n"
+            f"  BEFORE:\n{_fmt_chain(chain['before'][-3:])}\n"
+            f"  AFTER:\n{_fmt_chain(chain['after'][:3])}\n"
         )
+
+    # Cap evidence at 6000 chars to stay within context window.
+    # Python-assembled header is not sent to the model — only the body prompt.
+    ev_str    = _fmt_ev(evidence)
+    if len(ev_str) > 6000:
+        ev_str = ev_str[:6000] + "\n[evidence truncated for context limit]"
+
     prompt = (
         f"Alert  : [{alert['level']}] {alert['rule']}\n"
         f"Agent  : {', '.join(alert['agents'])} (ID: {alert['agent_id']})\n"
@@ -585,57 +645,80 @@ def call_llm(alert, evidence, chain):
         f"Src IP : {alert['src_ip'] or 'none'} | User: {alert['src_user'] or 'none'}\n"
         f"Log    : {alert['log']}\n"
         f"MITRE  : {alert['tactics']}\n\n"
-        f"EVIDENCE:\n{_fmt_ev(evidence)}\n{chain_str}\nWrite the report."
+        f"EVIDENCE:\n{ev_str}\n{chain_str}"
     )
+    log.debug("Prompt length: %d chars", len(prompt))
+
     client = ollama.Client(host=C["OL_HOST"])
-    t0, result, first = time.perf_counter(), "", True
+    t0     = time.perf_counter()
 
-    # Show a live elapsed timer while the model is reasoning/generating.
-    # qwen3 and similar models have a thinking phase that produces no visible
-    # output — without this the terminal looks frozen.
-    import threading
-
-    done  = threading.Event()
-    timer_line = [0]   # mutable so the thread can update it
-
+    # Ticker
+    done = threading.Event()
     def _ticker():
         chars = ["|", "/", "-", "\\"]
         i = 0
         while not done.is_set():
             elapsed = int(time.perf_counter() - t0)
-            sys.stdout.write(f"\r  Analysing... {chars[i % 4]} {elapsed}s elapsed")
+            sys.stdout.write(f"\r  Analysing... {chars[i%4]} {elapsed}s")
             sys.stdout.flush()
             i += 1
             time.sleep(0.5)
+    threading.Thread(target=_ticker, daemon=True).start()
 
-    ticker = threading.Thread(target=_ticker, daemon=True)
-    ticker.start()
-
+    result = ""
+    in_think = False
     try:
-        for chunk in client.chat(model=C["MODEL"], messages=[
-            {"role":"system","content":SYSTEM_PROMPT},
-            {"role":"user",  "content":prompt}
-        ], stream=True):
+        for chunk in client.chat(
+            model=C["MODEL"],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt}
+            ],
+            stream=True,
+            options={
+                "temperature": 0,
+                "num_ctx":     8192,
+                "num_predict": 2000,   # thinking tokens + report body both fit
+            }
+        ):
             if STOP_FLAG.is_set():
                 done.set()
                 break
             text = chunk.message.content
-            if text:
-                if first:
-                    done.set()       # signal ticker to stop
-                    ticker.join()    # wait for it to fully finish writing
-                    # Clear the ticker line completely before printing report
-                    sys.stdout.write("\r" + " " * 60 + "\r")
-                    elapsed = int(time.perf_counter() - t0)
-                    sys.stdout.write(f"  Thinking done ({elapsed}s). Generating report...\n\n")
-                    sys.stdout.flush()
-                    first = False
-                print(text, end="", flush=True)
-                result += text
+            if not text:
+                continue
+            result += text
+            # Track <think> block — suppress from display and result
+            if "<think>" in result and not in_think:
+                in_think = True
+            if in_think:
+                if "</think>" in result:
+                    import re as _rt
+                    result = _rt.sub(r"<think>.*?</think>", "", result,
+                                     flags=_rt.DOTALL).strip()
+                    # Also strip any leading garbage before </think>
+                    result = _rt.sub(r"^.*?</think>", "", result,
+                                     flags=_rt.DOTALL).strip()
+                    in_think = False
+                    if result and not done.is_set():
+                        done.set()
+                        sys.stdout.write("\r" + " " * 60 + "\r")
+                        elapsed = int(time.perf_counter() - t0)
+                        sys.stdout.write(f"  Generating ({elapsed}s thinking)...\n\n")
+                        sys.stdout.flush()
+                        print(result, end="", flush=True)
+                continue  # still in think block, don't print
+            # Normal output token
+            if result and not done.is_set():
+                done.set()
+                sys.stdout.write("\r" + " " * 60 + "\r")
+                elapsed = int(time.perf_counter() - t0)
+                sys.stdout.write(f"  Generating ({elapsed}s thinking)...\n\n")
+                sys.stdout.flush()
+            print(text, end="", flush=True)
         print()
     except Exception as e:
         done.set()
-        ticker.join()
         err = str(e)
         print(f"\n  ERR {err}")
         if "not found" in err.lower(): print(f"     -> Run: ollama pull {C['MODEL']}")
@@ -644,13 +727,56 @@ def call_llm(alert, evidence, chain):
     finally:
         done.set()
 
-    elapsed = int(time.perf_counter()-t0)
-    log.debug("Ollama -> %ds | %d chars generated", elapsed, len(result))
-    if not result.strip():
-        log.warning("Ollama returned EMPTY result after %ds", elapsed)
+    elapsed = int(time.perf_counter() - t0)
+    log.info("Ollama -> %ds | %d chars", elapsed, len(result))
+
+    # Strip thinking tokens
+    import re as _rethink
+    # Final cleanup of any remaining think artifacts
+    import re as _rethink
+    result = _rethink.sub(r"<think>.*?</think>", "", result, flags=_rethink.DOTALL)
+    result = _rethink.sub(r"^.*?</think>", "", result, flags=_rethink.DOTALL)
+    result = result.strip()
+
+    # Python builds the header — not the model
+    behaviors = evidence.get("behaviors_raw", {})
+    high_conf = [k for k, v in behaviors.items() if v.get("confidence") == "high"]
+    med_conf  = [k for k, v in behaviors.items() if v.get("confidence") == "medium"]
+    critical  = {"credential_dump","lateral_smb","wmi_execution",
+                 "pass_the_hash","process_injection","exploit"}
+    if any(b in critical for b in high_conf) or len(high_conf) >= 2:
+        risk = "CRITICAL"
+    elif high_conf or len(med_conf) >= 2:
+        risk = "HIGH"
+    elif med_conf:
+        risk = "MEDIUM"
     else:
-        log.info("Ollama report: first 200 chars: %s", result[:200])
-    return result
+        risk = "LOW"
+
+    status = "Disconnected" if "NOT IN WAZUH" in evidence.get("agent_status","")              else "Active"
+    os_    = evidence.get("agent_os", "Unknown")
+
+    beh_str = ""
+    if behaviors:
+        beh_str = "\nDETECTED BEHAVIORS\n" + "\n".join(
+            f"- {k.replace('_',' ').title()} [{v['confidence'].upper()}]"
+            for k, v in behaviors.items()
+        ) + "\n"
+
+    report = (
+        f"AGENT   : {', '.join(alert['agents'])} (ID: {alert['agent_id']}) | {os_}\n"
+        f"TIME    : {alert['ts']}\n"
+        f"STATUS  : {status}\n"
+        f"RISK    : {risk}\n"
+        f"{beh_str}\n"
+        f"{result}\n"
+    )
+
+    # No MITRE ID validation — system prompt instructs tactic names only
+
+    print("\n" + report)
+    log.info("Report done: %d chars, risk=%s", len(report), risk)
+    return report
 
 # -- Main ---------------------------------------------------------------------
 _enrolled = {}
@@ -662,9 +788,8 @@ STOP_FLAG = _threading.Event()
 def run(severity=MIN_SEV, hours=HOURS, agent_id=None):
     global _enrolled
     since = _since(hours)
-    print(f"\n{'='*56}\n  Wazuh Correlation Agent | Ollama ({C['MODEL']})")
-    print(f"  Severity : level >= {severity} | Period: last {hours}h")
-    print(f"  Target   : {f'agent {agent_id}' if agent_id else 'all agents'}\n{'='*56}\n")
+    print(f"severity>={severity} | last {hours}h | "
+          f"{'agent '+agent_id if agent_id else 'all agents'}\n")
 
     try:
         fleet = wget("/agents",{"limit":500,"select":"id,name,status"})
@@ -680,15 +805,8 @@ def run(severity=MIN_SEV, hours=HOURS, agent_id=None):
     except Exception as e:
         print(f"\n\n  ERR {type(e).__name__}: {e}\n"); return
 
-    print(f" {total} total")
-    for k,v in dist.items(): print(f"    {k}: {v}")
-    if not alerts: print("\n  No alerts found.\n"); return
-
-    print(f"\n  Alert groups (deduplicated):")
-    for i,a in enumerate(alerts[:10],1):
-        cov = (f"  covers: {', '.join(a['covered'][:3])}"
-               if len(a.get("covered",[]))>1 else "")
-        print(f"     {i}. [{a['level']}] {a['group'][:45]}  (x{a['count']}){cov}")
+    if not alerts: print("  No alerts found.\n"); return
+    log.debug("Alerts: %d total, groups: %s", total, [a['group'] for a in alerts[:5]])
 
     # One slot per type, max 5
     seen, top = set(), []
@@ -709,26 +827,29 @@ def run(severity=MIN_SEV, hours=HOURS, agent_id=None):
     for aid in {a["agent_id"] or agent_id or "000" for a in top}:
         ts = next((a["ts"] for a in top if (a["agent_id"] or "000")==aid), None)
         if not ts: continue
-        print(f"\n  Building attack chain for agent {aid}...", end="", flush=True)
+        log.debug("Building attack chain for agent %s", aid)
         try:
             chains[aid] = get_chain(aid, ts)
             c = chains[aid]
-            print(f" OK  {c['total']} events")
-            for pat in c["patterns"]: print(f"    ** {pat}")
-            if _enrolled and aid not in _enrolled:
-                print(f"    [!]  Agent {aid} not enrolled. "
-                      f"Enrolled: {', '.join(f'{i}={n}' for i,n in _enrolled.items())}")
+            log.debug("Chain: %d events, patterns: %s", c['total'], c['patterns'])
         except Exception as e:
             print(f" ERR {e}"); chains[aid] = None
 
-    print(f"\n{'='*56}\n  ANALYSIS ({len(top)} alert{'s' if len(top)>1 else ''})\n{'='*56}")
+    log.debug("Analysing %d alert group(s)", len(top))
     for i,alert in enumerate(top,1):
         aid   = alert["agent_id"] or agent_id or "000"
         chain = chains.get(aid)
-        print(f"\n  Collecting evidence for alert {i}/{len(top)}...", end="", flush=True)
+        log.debug("Collecting evidence for alert %d/%d", i, len(top))
         try:
             evidence = collect(alert, since, chain=chain)
-            print(" OK")
+            # Print the trigger alert as context before the report
+            print(f"TRIGGER ALERT")
+            print(f"- Rule    : [{alert['level']}] {alert['rule']}")
+            print(f"- Agent   : {', '.join(alert['agents'])} (ID: {alert['agent_id']})")
+            print(f"- Time    : {alert['ts']}")
+            if alert['src_ip']: print(f"- Src IP  : {alert['src_ip']}")
+            if alert['tactics']: print(f"- Tactics : {', '.join(alert['tactics'])}")
+            print()
         except RuntimeError as e:
             print(f"\n  [!]  Skipped -- {e}")
             evidence = {"agent_status":"DISCONNECTED or unreachable",
@@ -751,70 +872,6 @@ def run(severity=MIN_SEV, hours=HOURS, agent_id=None):
                  "172.26.","172.27.","172.28.","172.29.","172.30.","172.31."))
             print(f"  {ip:22s}  {'internal' if internal else '[!]  EXTERNAL'}")
     print()
-
-def run_from_prompt(prompt: str):
-    """
-    Accept a natural language prompt, use Ollama to extract investigation
-    parameters, then run the full correlation pipeline.
-
-    This is the entry point for the Wazuh dashboard assistant integration.
-    The prompt goes to Ollama once for parameter extraction (fast, no streaming,
-    temperature=0), then the full investigation runs with those parameters.
-
-    Examples:
-      "check agent 000 severity 5 last 24 hours"
-      "investigate all agents high severity events today"
-      "what happened on agent 004 in the past 48 hours"
-    """
-    extraction_prompt = (
-        f"Extract Wazuh investigation parameters from this message.\n"
-        f"Message: \"{prompt}\"\n\n"
-        f"Return ONLY a JSON object with these fields:\n"
-        f"  agent: the agent ID (e.g. \"000\", \"004\"). Empty string if all agents.\n"
-        f"  severity: minimum alert severity level (integer 3-15).\n"
-        f"    Map: all/any/everything=3, low=5, medium=7, high=10, critical=12.\n"
-        f"    If the user says \"severity 5\" or \"level 5\", use 5.\n"
-        f"    Default: 7\n"
-        f"  hours: time window in hours (integer).\n"
-        f"    Map: today=24, this week=168, 1 hour=1.\n"
-        f"    Default: 24\n\n"
-        f"Return ONLY the JSON, nothing else. Example:\n"
-        f'{{\"agent\": \"000\", \"severity\": 5, \"hours\": 24}}'
-    )
-
-    # Extract parameters using Ollama — single fast call, no streaming
-    severity = MIN_SEV
-    hours    = HOURS
-    agent_id = None
-    try:
-        client   = ollama.Client(host=C["OL_HOST"])
-        response = client.chat(
-            model=C["MODEL"],
-            messages=[{"role": "user", "content": extraction_prompt}],
-            stream=False,
-            options={"temperature": 0, "num_predict": 60}
-        )
-        import json as _json, re as _re
-        text = response.message.content.strip()
-        log.debug("Parameter extraction response: %s", text)
-        m = _re.search(r'\{[^}]+\}', text, _re.DOTALL)
-        if m:
-            parsed   = _json.loads(m.group())
-            severity = int(parsed.get("severity", MIN_SEV))
-            hours    = int(parsed.get("hours",    HOURS))
-            agent    = str(parsed.get("agent",    "")).strip()
-            agent_id = agent if agent else None
-            log.info("Extracted: severity=%d hours=%d agent=%s",
-                     severity, hours, agent_id or "all")
-    except Exception as e:
-        log.warning("Parameter extraction failed (%s) — using defaults", e)
-
-    # Run the full investigation with extracted parameters
-    log.info("Starting investigation: severity=%d hours=%d agent=%s",
-             severity, hours, agent_id or "all")
-    run(severity=severity, hours=hours, agent_id=agent_id)
-    log.info("Investigation complete")
-
 
 def main():
     p = argparse.ArgumentParser(description=f"Wazuh Correlation Agent [Ollama]")
